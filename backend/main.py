@@ -3,23 +3,89 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import trafilatura
+import time
 
 app = FastAPI()
 
 BRAVE_API_KEY = "BSAYcmGcjd6eznA7um8osQlNpvCfD51"
 
-# CORS setup (allow only your frontend)
+# Hugging Face Inference API (hard-coded token as requested)
+HF_API_URL = "https://api-inference.huggingface.co/models/sshleifer/distilbart-cnn-12-6"
+HF_API_TOKEN = "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"  # ⚠️ Hard-coded token (not recommended for production)
+HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}", "Accept": "application/json"}
+
+# CORS setup (allow only your frontend + trycloudflare pattern)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "https://froont-h1cg.vercel.app",  # your Vercel frontend
+        "http://localhost:3000",           # dev
+    ],
+    allow_origin_regex=r"^https://[a-z0-9-]+\.trycloudflare\.com$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize summarization pipeline
-# Note: loading the model can be slow; prefer to load once at startup as shown here.
-summarize_via_hf("summarization", model="sshleifer/distilbart-cnn-12-6")
+
+def summarize_via_hf(text: str, max_retries: int = 2, backoff: float = 1.0) -> str:
+    """
+    Call Hugging Face Inference API to summarize `text`.
+    Returns the summary string, or an error message string (prefixed) on failure.
+    Retries on transient errors (429, network).
+    """
+    if not text or not text.strip():
+        return None
+
+    # You can tune parameters (min_length/max_length) here if you wish
+    payload = {
+        "inputs": text,
+        "parameters": {"min_length": 30, "max_length": 130, "do_sample": False},
+    }
+
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            resp = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, timeout=30)
+            # rate-limited
+            if resp.status_code == 429:
+                # exponential backoff-ish
+                time.sleep(backoff * (attempt + 1))
+                attempt += 1
+                continue
+
+            if resp.status_code >= 400:
+                # return an error string so caller can include it in the response
+                return f"Summary error (status {resp.status_code}): {resp.text[:500]}"
+
+            data = resp.json()
+
+            # HF returns a list like: [{"summary_text":"..."}]
+            if isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                if isinstance(first, dict) and "summary_text" in first:
+                    return first["summary_text"]
+                if isinstance(first, str):
+                    return first
+
+            # some endpoints may return a dict with 'error'
+            if isinstance(data, dict):
+                if "error" in data:
+                    return f"Summary error: {data.get('error')}"
+                if "summary_text" in data:
+                    return data["summary_text"]
+
+            # fallback: stringify the response
+            return str(data)[:1000]
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(backoff * (attempt + 1))
+                attempt += 1
+                continue
+            return f"Summary request failed: {str(e)}"
+
+    return "Summary unavailable after retries"
+
 
 @app.get("/search_summary")
 def search_and_summarize(
@@ -29,7 +95,7 @@ def search_and_summarize(
 ):
     """
     Search Brave Web API with optional country and ui_lang, fetch pages,
-    extract text, and summarize each page using the HF summarization pipeline.
+    extract text with trafilatura, and summarize each page using the Hugging Face Inference API.
     Returns results list and a combined_summary.
     """
     url = "https://api.search.brave.com/res/v1/web/search"
@@ -38,7 +104,6 @@ def search_and_summarize(
         "Accept-Encoding": "gzip",
         "X-Subscription-Token": BRAVE_API_KEY,
     }
-    # pass query, country and ui_lang to Brave API
     params = {"q": q, "count": 7, "country": country, "ui_lang": ui_lang}
 
     response = requests.get(url, headers=headers, params=params)
@@ -55,22 +120,19 @@ def search_and_summarize(
         summary = None
 
         try:
-            # fetch and extract
+            # fetch and extract page content
             downloaded = trafilatura.fetch_url(url_item)
             if downloaded:
                 extracted = trafilatura.extract(downloaded)
                 if extracted:
-                    # Truncate to 900 characters for faster summarization
+                    # Truncate to 900 chars for faster summarization (tweak as needed)
                     content_preview = extracted[:900]
-                    # Generate summary (no explicit min/max length, model default)
-                    try:
-                        out = summarizer(content_preview, do_sample=False)
-                        # pipeline returns list of dicts with 'summary_text'
-                        if out and isinstance(out, list):
-                            summary = out[0].get("summary_text")
-                    except Exception as s_err:
-                        summary = f"Summarization error: {s_err}"
-                    if summary:
+
+                    # Call HF Inference API to summarize the content_preview
+                    summary = summarize_via_hf(content_preview)
+
+                    # Only add summary to combined list if it's not an HF error string
+                    if summary and not (summary.startswith("Summary error") or summary.startswith("Summary request failed")):
                         url_summaries.append(summary)
         except Exception as e:
             content_preview = f"Error extracting: {str(e)}"
@@ -88,4 +150,10 @@ def search_and_summarize(
     # Combine all URL summaries into a single text
     combined_summary = " ".join(url_summaries) if url_summaries else None
 
-    return {"query": q, "country": country, "ui_lang": ui_lang, "results": results, "combined_summary": combined_summary}
+    return {
+        "query": q,
+        "country": country,
+        "ui_lang": ui_lang,
+        "results": results,
+        "combined_summary": combined_summary,
+    }

@@ -3,7 +3,6 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import trafilatura
-from transformers import pipeline
 
 app = FastAPI()
 
@@ -20,7 +19,7 @@ app.add_middleware(
 
 # Initialize summarization pipeline
 # Note: loading the model can be slow; prefer to load once at startup as shown here.
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+summarize_via_hf()
 
 @app.get("/search_summary")
 def search_and_summarize(
